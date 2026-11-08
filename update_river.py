@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """Baja los próximos partidos de River Plate desde la API pública de ESPN (sin clave) y los guarda en river.json.
 
-Prueba varias direcciones de ESPN y escribe en el log cuál funcionó, para poder diagnosticar rápido.
+Prueba varias direcciones de ESPN y escribe en el log qué devolvió cada una, para diagnosticar rápido.
 Si ninguna responde, o no hay partidos futuros, termina con error y NO pisa el river.json anterior.
 Variables opcionales: RIVER_OUT (ruta de salida), ALLOW_EMPTY=1 (permite guardar la lista vacía, útil en receso).
 """
 import json
 import os
-import sys
 import urllib.request
+from collections import Counter
 from datetime import datetime, timedelta, timezone
 
 RIVER_ID = "16"  # River Plate en ESPN
@@ -41,13 +41,24 @@ def parse_date(s):
     return dt.astimezone(AR)
 
 
-def to_match(ev, league_name):
-    """Convierte un evento de ESPN en nuestro formato. Devuelve None si no es de River o ya terminó."""
+def is_river(c):
+    team = c.get("team") or {}
+    return (str(team.get("id")) == RIVER_ID or str(c.get("id")) == RIVER_ID
+            or "river plate" in (team.get("displayName") or "").lower())
+
+
+def status_of(ev):
+    comp = (ev.get("competitions") or [{}])[0]
+    return (comp.get("status") or ev.get("status") or {}).get("type") or {}
+
+
+def to_match(ev, league_name, trust):
+    """Convierte un evento de ESPN a nuestro formato. `trust`=True si la dirección ya es solo de River."""
     comp = (ev.get("competitions") or [{}])[0]
     teams = comp.get("competitors") or []
-    if RIVER_ID not in [str((c.get("team") or {}).get("id")) for c in teams]:
+    if not trust and not any(is_river(c) for c in teams):
         return None
-    status = (comp.get("status") or ev.get("status") or {}).get("type") or {}
+    status = status_of(ev)
     name = (status.get("name") or "").upper()
     if status.get("state") == "post" or status.get("completed") or "CANCEL" in name:
         return None
@@ -65,23 +76,32 @@ def to_match(ev, league_name):
         "status": status.get("description") or status.get("name") or "",
         "home": (home.get("team") or {}).get("displayName", ""),
         "away": (away.get("team") or {}).get("displayName", ""),
-        "river_is_home": str((home.get("team") or {}).get("id")) == RIVER_ID,
+        "river_is_home": is_river(home),
         "competition": league_name,
     }
+
+
+def describe(events):
+    """Resumen para el log: rango de fechas y estados de los eventos."""
+    dates = sorted(e["date"][:10] for e in events if e.get("date"))
+    states = Counter(status_of(e).get("state") for e in events)
+    rango = f"{dates[0]} -> {dates[-1]}" if dates else "sin fechas"
+    return f"fechas {rango} | estados {dict(states)}"
 
 
 def collect(now):
     d0 = now.astimezone(AR).strftime("%Y%m%d")
     d1 = (now + timedelta(days=75)).astimezone(AR).strftime("%Y%m%d")
-    tries = [
-        ("schedule arg.1", f"{BASE}/arg.1/teams/{RIVER_ID}/schedule", "Liga Profesional"),
-        ("schedule all", f"{BASE}/all/teams/{RIVER_ID}/schedule", ""),
-    ]
+    # (nombre, dirección, nombre de competencia, ¿la dirección es solo de River?)
+    tries = []
     for slug, label in LEAGUES.items():
-        tries.append((f"scoreboard {slug}", f"{BASE}/{slug}/scoreboard?dates={d0}-{d1}&limit=500", label))
+        tries.append((f"fixtures {slug}", f"{BASE}/{slug}/teams/{RIVER_ID}/schedule?fixture=true", label, True))
+    tries.append(("fixtures all", f"{BASE}/all/teams/{RIVER_ID}/schedule?fixture=true", "", True))
+    tries.append(("scoreboard arg.1 rango", f"{BASE}/arg.1/scoreboard?dates={d0}-{d1}", "Liga Profesional", False))
+    tries.append(("scoreboard arg.1 hoy", f"{BASE}/arg.1/scoreboard?dates={d0}", "Liga Profesional", False))
 
     found, responded = {}, 0
-    for name, url, label in tries:
+    for name, url, label, trust in tries:
         try:
             data = get_json(url)
         except Exception as e:  # noqa: BLE001
@@ -90,8 +110,8 @@ def collect(now):
         responded += 1
         league_name = ((data.get("leagues") or [{}])[0].get("name")) or label
         events = data.get("events") or []
-        mine = [m for m in (to_match(ev, league_name) for ev in events) if m]
-        print(f"[{name}] OK: {len(events)} eventos, {len(mine)} de River sin terminar")
+        mine = [m for m in (to_match(ev, league_name, trust) for ev in events) if m]
+        print(f"[{name}] OK: {len(events)} eventos, {len(mine)} de River sin terminar | {describe(events)}")
         for m in mine:
             found[m["id"] or (m["kickoff"], m["home"], m["away"])] = m
     if responded == 0:
