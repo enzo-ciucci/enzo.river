@@ -1,97 +1,94 @@
 #!/usr/bin/env python3
-"""Baja los próximos partidos de River Plate desde API-Football y los guarda en river.json.
+"""Baja los próximos partidos de River Plate desde TheSportsDB (gratis, sin clave) y los guarda en river.json.
 
-Necesita la variable de entorno API_FOOTBALL_KEY.
-Opcional: RIVER_TEAM_ID (para saltear la búsqueda) y RIVER_OUT (ruta de salida).
 Si algo falla, termina con error y NO pisa el river.json anterior.
+Opcional: RIVER_OUT (ruta de salida).
 """
 import json
 import os
 import sys
-import urllib.parse
 import urllib.request
 from datetime import datetime, timedelta, timezone
 
-BASE = "https://v3.football.api-sports.io"
-TZ = "America/Argentina/Buenos_Aires"
+TEAM_ID = "135171"  # River Plate en TheSportsDB
+BASE = "https://www.thesportsdb.com/api/v1/json"
+KEYS = ("123", "3")  # claves públicas de prueba que ofrece TheSportsDB
+AR = timezone(timedelta(hours=-3))  # Argentina no usa horario de verano
 OUT = os.environ.get("RIVER_OUT", "river.json")
-KEY = os.environ.get("API_FOOTBALL_KEY", "")
 
-# Estados de API-Football: TBD = hora a definir, PST = postergado
-SIN_HORA_CONFIRMADA = {"TBD", "PST"}
-DESCARTAR = {"CANC", "ABD", "AWD", "WO", "FT", "AET", "PEN"}
+DESCARTAR = {"match finished", "ft", "aet", "pen", "canceled", "cancelled", "abandoned", "walkover"}
+SIN_HORA = {"postponed", "pst", "tbd", "time to be defined"}
 
 
-def get(path, **params):
-    url = f"{BASE}/{path}?{urllib.parse.urlencode(params)}"
-    req = urllib.request.Request(url, headers={"x-apisports-key": KEY})
-    with urllib.request.urlopen(req, timeout=30) as r:
-        data = json.load(r)
-    errors = data.get("errors")
-    if errors:  # la API responde 200 aunque haya errores (lista o dict)
-        raise RuntimeError(f"{path}: {errors}")
-    return data.get("response", [])
-
-
-def find_team_id():
-    forced = os.environ.get("RIVER_TEAM_ID")
-    if forced:
-        return int(forced), "River Plate"
-    for item in get("teams", search="river"):
-        t = item["team"]
-        if t.get("country") == "Argentina" and t.get("name", "").lower() == "river plate":
-            return t["id"], t["name"]
-    raise RuntimeError("No encontré a River Plate (Argentina) en la búsqueda")
-
-
-def fetch_fixtures(team_id, now):
-    # Temporada = año calendario. Desde noviembre miramos también el año siguiente.
-    seasons = [now.year] + ([now.year + 1] if now.month >= 11 else [])
-    rows, errs = [], []
-    for s in seasons:
+def fetch_events():
+    """Devuelve la lista de próximos eventos (puede ser vacía). Falla solo si ninguna clave respondió."""
+    errors = []
+    for key in KEYS:
+        url = f"{BASE}/{key}/eventsnext.php?id={TEAM_ID}"
         try:
-            rows += get("fixtures", team=team_id, season=s, timezone=TZ)
+            req = urllib.request.Request(url, headers={"User-Agent": "enzo-river/1.0"})
+            with urllib.request.urlopen(req, timeout=30) as r:
+                data = json.load(r)
+            events = data.get("events") or []
+            if events:
+                return events
+            errors.append(f"clave {key}: respuesta sin eventos")
         except Exception as e:  # noqa: BLE001
-            errs.append(str(e))
-            print("AVISO:", e, file=sys.stderr)
-    if not rows and errs:
-        raise RuntimeError("; ".join(errs))
-    return rows
+            errors.append(f"clave {key}: {e}")
+            print("AVISO:", errors[-1], file=sys.stderr)
+    if all("sin eventos" in e for e in errors):
+        return []  # respuesta válida pero vacía (por ejemplo, receso)
+    raise RuntimeError("; ".join(errors))
 
 
-def build_matches(rows, team_id, now):
+def parse_start(e):
+    """Devuelve (inicio con zona horaria, hora_confirmada). TheSportsDB informa en UTC."""
+    ts = e.get("strTimestamp")
+    if ts:
+        dt = datetime.fromisoformat(ts)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(AR), True
+    date = e.get("dateEvent")
+    if date:  # hay fecha pero no hora
+        return datetime.fromisoformat(date).replace(tzinfo=AR), False
+    return None, False
+
+
+def build_matches(events, now):
     out = []
-    for r in rows:
-        f = r["fixture"]
-        status = f["status"]["short"]
+    for e in events:
+        status = (e.get("strStatus") or "").strip().lower()
         if status in DESCARTAR:
             continue
-        start = datetime.fromisoformat(f["date"])
-        if start < now - timedelta(hours=3):  # ya pasó (dejamos 3 h por los partidos en juego)
+        start, confirmed = parse_start(e)
+        if start is None or start < now - timedelta(hours=3):
             continue
         out.append({
-            "kickoff": f["date"],
-            "kickoff_confirmed": status not in SIN_HORA_CONFIRMADA,
-            "status": status,
-            "home": r["teams"]["home"]["name"],
-            "away": r["teams"]["away"]["name"],
-            "river_is_home": r["teams"]["home"]["id"] == team_id,
-            "competition": r["league"]["name"],
+            "kickoff": start.isoformat(timespec="seconds"),
+            "kickoff_confirmed": confirmed and status not in SIN_HORA,
+            "status": e.get("strStatus") or "",
+            "home": e.get("strHomeTeam") or "",
+            "away": e.get("strAwayTeam") or "",
+            "river_is_home": str(e.get("idHomeTeam")) == TEAM_ID,
+            "competition": e.get("strLeague") or "",
         })
     out.sort(key=lambda m: datetime.fromisoformat(m["kickoff"]))
     return out[:15]
 
 
 def main():
-    if not KEY:
-        sys.exit("Falta la variable API_FOOTBALL_KEY")
     now = datetime.now(timezone.utc)
-    team_id, team_name = find_team_id()
-    matches = build_matches(fetch_fixtures(team_id, now), team_id, now)
+    events = fetch_events()
+    if events:  # para chequear a ojo que la hora sea la correcta
+        e = events[0]
+        print("Primer evento crudo:", {k: e.get(k) for k in (
+            "strEvent", "dateEvent", "strTime", "strTimestamp", "strStatus", "strLeague")})
+    matches = build_matches(events, now)
     payload = {
         # "updated" cambia en cada corrida: así siempre hay commit y GitHub no pausa la tarea programada
         "updated": now.isoformat(timespec="seconds"),
-        "team": {"id": team_id, "name": team_name},
+        "team": {"id": TEAM_ID, "name": "River Plate"},
         "matches": matches,
     }
     with open(OUT, "w", encoding="utf-8") as fh:
