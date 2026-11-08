@@ -1,16 +1,17 @@
 #!/usr/bin/env python3
 """Baja los próximos partidos de River Plate desde la API pública de ESPN (sin clave) y los guarda en river.json.
 
-Método: ESPN contesta bien cuando se le pide UN día (scoreboard?dates=AAAAMMDD) y da error con rangos.
-Entonces revisamos día por día los próximos ~60 días y nos quedamos con los partidos de River.
-Escribe en el log qué devolvió cada dirección, para diagnosticar rápido.
-Si ninguna responde, o no hay partidos futuros, termina con error y NO pisa el river.json anterior.
-Variables opcionales: RIVER_OUT (ruta de salida), ALLOW_EMPTY=1 (permite guardar la lista vacía, útil en receso).
+Fuente principal: el calendario de la temporada de River en cada competencia (teams/16/schedule?season=AAAA).
+Red de seguridad: si ahí no hay partidos por jugar, revisa día por día los próximos ~60 días
+(ESPN contesta bien un día solo y da error con rangos de fechas).
+
+Si no hay partidos definidos, guarda "matches": [] (es un resultado válido, no un error).
+Falla (y NO pisa el river.json anterior) solo si ESPN no responde o responde sin ningún dato.
+Variable opcional: RIVER_OUT (ruta de salida).
 """
 import json
 import os
 import urllib.request
-from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 
@@ -18,7 +19,6 @@ RIVER_ID = "16"  # River Plate en ESPN
 BASE = "https://site.api.espn.com/apis/site/v2/sports/soccer"
 AR = timezone(timedelta(hours=-3))  # Argentina no usa horario de verano
 OUT = os.environ.get("RIVER_OUT", "river.json")
-ALLOW_EMPTY = os.environ.get("ALLOW_EMPTY") == "1"
 DAYS_AHEAD = 60
 LEAGUES = {
     "arg.1": "Liga Profesional",
@@ -32,6 +32,18 @@ def get_json(url):
     req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (compatible; enzo-river/1.0)"})
     with urllib.request.urlopen(req, timeout=30) as r:
         return json.load(r)
+
+
+def fetch_safe(url):
+    try:
+        return get_json(url), None
+    except Exception as e:  # noqa: BLE001
+        return None, str(e)
+
+
+def fetch_many(urls):
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        return list(ex.map(fetch_safe, urls))
 
 
 def parse_date(s):
@@ -54,16 +66,6 @@ def is_river(c):
 def status_of(ev):
     comp = (ev.get("competitions") or [{}])[0]
     return (comp.get("status") or ev.get("status") or {}).get("type") or {}
-
-
-def league_of(ev, data, label):
-    lg = ev.get("league")
-    if isinstance(lg, dict) and lg.get("name"):
-        return lg["name"]
-    leagues = data.get("leagues") or []
-    if len(leagues) == 1 and leagues[0].get("name"):
-        return leagues[0]["name"]
-    return label
 
 
 def to_match(ev, league_name, trust):
@@ -95,83 +97,54 @@ def to_match(ev, league_name, trust):
     }
 
 
-def describe(events):
-    """Resumen para el log: rango de fechas y estados de los eventos."""
-    dates = sorted(e["date"][:10] for e in events if e.get("date"))
-    states = Counter(status_of(e).get("state") for e in events)
-    rango = f"{dates[0]} -> {dates[-1]}" if dates else "sin fechas"
-    return f"fechas {rango} | estados {dict(states)}"
-
-
-def fetch_safe(url):
-    try:
-        return get_json(url), None
-    except Exception as e:  # noqa: BLE001
-        return None, str(e)
-
-
-def sweep(slug, label, days):
-    """Revisa día por día el scoreboard de `slug`. Devuelve (partidos de River, días ok, días con error, eventos vistos, primer error)."""
-    urls = [f"{BASE}/{slug}/scoreboard?dates={d}" for d in days]
-    with ThreadPoolExecutor(max_workers=8) as ex:
-        results = list(ex.map(fetch_safe, urls))
-    mine, ok, bad, seen, first_err = [], 0, 0, 0, None
-    for data, err in results:
-        if err:
-            bad += 1
-            first_err = first_err or err
-            continue
-        ok += 1
-        events = data.get("events") or []
-        seen += len(events)
-        for ev in events:
-            m = to_match(ev, league_of(ev, data, label), trust=False)
-            if m:
-                mine.append(m)
-    return mine, ok, bad, seen, first_err
-
-
 def collect(now):
     today = now.astimezone(AR)
-    days = [(today + timedelta(days=i)).strftime("%Y%m%d") for i in range(DAYS_AHEAD + 1)]
-    found, responded = {}, 0
+    found, responded, seen = {}, 0, 0
 
     def add(ms):
         for m in ms:
-            found[m["id"] or (m["kickoff"], m["home"], m["away"])] = m
+            found.setdefault(m["id"] or (m["kickoff"], m["home"], m["away"]), m)
 
-    # 1) Direcciones de "calendario del equipo" (solo para diagnóstico; ya vimos que a veces devuelven vacío)
-    for name, url in (
-        ("schedule arg.1 season", f"{BASE}/arg.1/teams/{RIVER_ID}/schedule?season={today.year}"),
-        ("schedule arg.1 season fixture", f"{BASE}/arg.1/teams/{RIVER_ID}/schedule?season={today.year}&fixture=true"),
-    ):
-        data, err = fetch_safe(url)
+    # 1) Calendario de River por competencia y temporada (desde noviembre miramos también el año siguiente)
+    seasons = [today.year] + ([today.year + 1] if today.month >= 11 else [])
+    tasks = [(slug, label, s) for s in seasons for slug, label in LEAGUES.items()]
+    urls = [f"{BASE}/{slug}/teams/{RIVER_ID}/schedule?season={s}" for slug, _, s in tasks]
+    for (slug, label, s), (data, err) in zip(tasks, fetch_many(urls)):
         if err:
-            print(f"[{name}] FALLÓ: {err}")
+            print(f"[calendario {slug} {s}] sin datos: {err}")
             continue
         responded += 1
         events = data.get("events") or []
-        ms = [m for m in (to_match(ev, "Liga Profesional", True) for ev in events) if m]
-        print(f"[{name}] OK: {len(events)} eventos, {len(ms)} de River sin terminar | {describe(events)}")
+        seen += len(events)
+        ms = [m for m in (to_match(ev, label, True) for ev in events) if m]
+        print(f"[calendario {slug} {s}] {len(events)} partidos de River en la temporada, {len(ms)} por jugar")
         add(ms)
 
-    # 2) Día por día. Primero probamos "all" (todas las competencias en una sola dirección).
-    probe, err = fetch_safe(f"{BASE}/all/scoreboard?dates={days[0]}")
-    use_all = bool(probe) and len(probe.get("events") or []) > 5
-    print(f"[scoreboard all hoy] {'OK: ' + str(len(probe.get('events') or [])) + ' eventos' if probe else 'FALLÓ: ' + str(err)}"
-          f" -> {'usamos all' if use_all else 'usamos cada competencia por separado'}")
-    targets = [("all", "")] if use_all else list(LEAGUES.items())
-    for slug, label in targets:
-        mine, ok, bad, seen, first_err = sweep(slug, label, days)
-        if ok:
-            responded += 1
-        extra = f" | primer error: {first_err}" if first_err else ""
-        print(f"[scoreboard {slug} x{len(days)} días] {ok} ok, {bad} con error, {seen} eventos vistos, "
-              f"{len(mine)} de River sin terminar{extra}")
-        add(mine)
+    # 2) Red de seguridad: si no hay partidos por jugar, miramos día por día
+    if not found:
+        days = [(today + timedelta(days=i)).strftime("%Y%m%d") for i in range(DAYS_AHEAD + 1)]
+        for slug, label in LEAGUES.items():
+            results = fetch_many([f"{BASE}/{slug}/scoreboard?dates={d}" for d in days])
+            ok = sum(1 for _, err in results if not err)
+            vistos, mine = 0, []
+            for data, err in results:
+                if err:
+                    continue
+                events = data.get("events") or []
+                vistos += len(events)
+                mine += [m for m in (to_match(ev, label, False) for ev in events) if m]
+            first_err = next((err for _, err in results if err), None)
+            if ok:
+                responded += 1
+            seen += vistos
+            extra = f" | primer error: {first_err}" if first_err else ""
+            print(f"[día por día {slug}] {ok}/{len(days)} días ok, {vistos} partidos vistos, {len(mine)} de River por jugar{extra}")
+            add(mine)
 
     if responded == 0:
         raise RuntimeError("Ninguna dirección de ESPN respondió")
+    if seen == 0:
+        raise RuntimeError("ESPN respondió pero sin ningún partido: algo cambió en la fuente; revisá el log")
     return list(found.values())
 
 
@@ -180,13 +153,14 @@ def main():
     matches = [m for m in collect(now) if datetime.fromisoformat(m["kickoff"]) >= now - timedelta(hours=3)]
     matches.sort(key=lambda m: datetime.fromisoformat(m["kickoff"]))
     matches = matches[:15]
-    if not matches and not ALLOW_EMPTY:
-        raise RuntimeError("ESPN respondió pero no devolvió partidos futuros de River; revisá el log")
     for m in matches:
         m.pop("id", None)
-    for m in matches[:3]:
-        print("Próximo:", m["kickoff"], "|", m["home"], "vs", m["away"], "|", m["competition"],
-              "| hora confirmada" if m["kickoff_confirmed"] else "| hora por confirmar")
+    if matches:
+        for m in matches[:3]:
+            print("Próximo:", m["kickoff"], "|", m["home"], "vs", m["away"], "|", m["competition"],
+                  "| hora confirmada" if m["kickoff_confirmed"] else "| hora por confirmar")
+    else:
+        print("River no tiene partidos definidos por ahora (se guarda la lista vacía).")
     payload = {
         # "updated" cambia en cada corrida: así siempre hay commit y GitHub no pausa la tarea programada
         "updated": now.isoformat(timespec="seconds"),
