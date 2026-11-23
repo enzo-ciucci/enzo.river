@@ -1,18 +1,8 @@
 {
-  "updated": "2026-11-22T18:57:38+00:00",
+  "updated": "2026-11-23T01:23:27+00:00",
   "team": {
     "id": "16",
     "name": "River Plate"
   },
-  "matches": [
-    {
-      "kickoff": "2026-11-22T19:00:00-03:00",
-      "kickoff_confirmed": true,
-      "status": "Scheduled",
-      "home": "River Plate",
-      "away": "Lanús",
-      "river_is_home": true,
-      "competition": "Liga Profesional"
-    }
-  ]
+  "matches": []
 }
