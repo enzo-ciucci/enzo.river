@@ -1,8 +1,18 @@
 {
-  "updated": "2026-11-25T13:32:15+00:00",
+  "updated": "2026-11-25T19:01:47+00:00",
   "team": {
     "id": "16",
     "name": "River Plate"
   },
-  "matches": []
+  "matches": [
+    {
+      "kickoff": "2026-11-29T17:00:00-03:00",
+      "kickoff_confirmed": false,
+      "status": "Scheduled",
+      "home": "Instituto (Córdoba)",
+      "away": "River Plate",
+      "river_is_home": false,
+      "competition": "Liga Profesional"
+    }
+  ]
 }
